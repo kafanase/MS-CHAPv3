@@ -1,0 +1,13 @@
+{
+  "server": "example.com:443",
+  "username": "alice",
+  "password": "PASSWORD-FROM-ADDUSER",
+  "listen": "127.0.0.1:1080",
+  "dns": "1.1.1.1:53",
+  "tls": {
+    "enabled": true,
+    "server_name": "example.com",
+    "pin_sha256": "",
+    "insecure": false
+  }
+}

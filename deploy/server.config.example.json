@@ -1,0 +1,11 @@
+{
+  "listen": "0.0.0.0:443",
+  "tls": { "enabled": true, "cert": "cert.pem", "key": "key.pem" },
+  "fallback": "127.0.0.1:8080",
+  "kdf_iterations": 600000,
+  "allow_private_targets": false,
+  "connect_timeout_sec": 10,
+  "log_targets": false,
+  "secret": "СГЕНЕРИРУЕТСЯ командой -genconfig",
+  "users": []
+}
