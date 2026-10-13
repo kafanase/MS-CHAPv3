@@ -34,9 +34,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"mschapv3proxy/internal/wire"
 	"mschapv3proxy/mschapv3"
 )
+
+type quicStreamConn struct {
+	quic.Stream
+	laddr net.Addr
+	raddr net.Addr
+}
+
+func (s *quicStreamConn) LocalAddr() net.Addr  { return s.laddr }
+func (s *quicStreamConn) RemoteAddr() net.Addr { return s.raddr }
+func (s *quicStreamConn) CloseWrite() error    { return s.Stream.Close() }
 
 // ---------- конфигурация ----------
 
@@ -311,7 +323,7 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
-func (s *server) dialTarget(host string, port uint16) (net.Conn, byte) {
+func (s *server) dialTargetNetwork(network, host string, port uint16) (net.Conn, byte) {
 	timeout := time.Duration(s.cfg.ConnectTimeout) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -340,7 +352,7 @@ func (s *server) dialTarget(host string, port uint16) (net.Conn, byte) {
 	code := wire.StatusFail
 	var d net.Dialer
 	for _, ip := range allowed {
-		c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), fmt.Sprint(port)))
+		c, err := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), fmt.Sprint(port)))
 		if err == nil {
 			return c, wire.StatusOK
 		}
@@ -349,6 +361,158 @@ func (s *server) dialTarget(host string, port uint16) (net.Conn, byte) {
 		}
 	}
 	return nil, code
+}
+
+func (s *server) dialTarget(host string, port uint16) (net.Conn, byte) {
+	return s.dialTargetNetwork("tcp", host, port)
+}
+
+func (s *server) dialTargetUDP(host string, port uint16) (net.Conn, byte) {
+	return s.dialTargetNetwork("udp", host, port)
+}
+
+func generateTempCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
+	tpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "mschapv3-server"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  key,
+	}, nil
+}
+
+func (s *server) handleQUIC(qconn quic.Connection) {
+	ctx := context.Background()
+	st, err := qconn.AcceptStream(ctx)
+	if err != nil {
+		return
+	}
+	defer st.Close()
+
+	cs := qconn.ConnectionState().TLS
+	binding, err := cs.ExportKeyingMaterial("EXPORTER-MSCHAPV3", nil, 32)
+	if err != nil {
+		return
+	}
+
+	streamConn := &quicStreamConn{
+		Stream: st,
+		laddr:  qconn.LocalAddr(),
+		raddr:  qconn.RemoteAddr(),
+	}
+
+	br := bufio.NewReader(streamConn)
+	sess, user, err := wire.ServerAccept(streamConn, br, wire.ServerParams{
+		Auth:       s.auth,
+		TLSBinding: binding,
+		Encrypt:    false,
+	})
+	if err != nil {
+		ip, _, _ := net.SplitHostPort(qconn.RemoteAddr().String())
+		s.ft.fail(ip)
+		log.Printf("quic auth failed: user=%q err=%v", user, err)
+		return
+	}
+
+	if sess.Cmd != wire.CmdUDP {
+		sess.Stream.Write([]byte{wire.StatusFail})
+		return
+	}
+
+	if _, err := sess.Stream.Write([]byte{wire.StatusOK}); err != nil {
+		return
+	}
+
+	ip, _, _ := net.SplitHostPort(qconn.RemoteAddr().String())
+	if s.cfg.LogTargets {
+		log.Printf("quic udp session started: user=%q from=%s", sess.User, ip)
+	}
+
+	s.serveQUICUDPSession(ctx, qconn, sess.User)
+}
+
+func (s *server) serveQUICUDPSession(ctx context.Context, qconn quic.Connection, user string) {
+	var mu sync.Mutex
+	udpConns := make(map[string]net.Conn)
+
+	defer func() {
+		mu.Lock()
+		for _, c := range udpConns {
+			c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	for {
+		data, err := qconn.ReceiveDatagram(ctx)
+		if err != nil {
+			return
+		}
+		dstHost, dstPort, payload, err := wire.DecodeUDPDatagram(data)
+		if err != nil {
+			continue
+		}
+
+		key := fmt.Sprintf("%s:%d", dstHost, dstPort)
+
+		mu.Lock()
+		targetConn := udpConns[key]
+		mu.Unlock()
+
+		if targetConn == nil {
+			var code byte
+			targetConn, code = s.dialTargetUDP(dstHost, dstPort)
+			if code != wire.StatusOK {
+				continue
+			}
+
+			mu.Lock()
+			udpConns[key] = targetConn
+			mu.Unlock()
+
+			go func(k, h string, p uint16, tc net.Conn) {
+				defer func() {
+					tc.Close()
+					mu.Lock()
+					delete(udpConns, k)
+					mu.Unlock()
+				}()
+
+				buf := make([]byte, 65535)
+				for {
+					tc.SetReadDeadline(time.Now().Add(60 * time.Second))
+					n, err := tc.Read(buf)
+					if err != nil {
+						return
+					}
+					enc, err := wire.EncodeUDPDatagram(h, p, buf[:n])
+					if err != nil {
+						continue
+					}
+					if err := qconn.SendDatagram(enc); err != nil {
+						return
+					}
+				}
+			}(key, dstHost, dstPort, targetConn)
+		}
+
+		targetConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		targetConn.Write(payload)
+	}
 }
 
 func (s *server) handle(conn net.Conn) {
@@ -463,6 +627,43 @@ func run(cfgPath string) {
 	}
 	log.Printf("listening on %s (tls=%v, users=%d)", cfg.Listen, cfg.TLS.Enabled, len(users))
 	go s.ft.gc()
+
+	var quicTLS *tls.Config
+	if s.tlsCfg != nil {
+		quicTLS = s.tlsCfg.Clone()
+		quicTLS.NextProtos = append([]string{"mschapv3-quic"}, quicTLS.NextProtos...)
+	} else {
+		cert, err := generateTempCert()
+		if err != nil {
+			log.Fatalf("generate quic cert: %v", err)
+		}
+		quicTLS = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS13,
+			NextProtos:   []string{"mschapv3-quic"},
+		}
+	}
+
+	qconf := &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: 15 * time.Second,
+	}
+
+	qlistener, err := quic.ListenAddr(cfg.Listen, quicTLS, qconf)
+	if err != nil {
+		log.Printf("warning: quic listen on %s failed: %v", cfg.Listen, err)
+	} else {
+		log.Printf("listening QUIC on %s", cfg.Listen)
+		go func() {
+			for {
+				qconn, err := qlistener.Accept(context.Background())
+				if err != nil {
+					return
+				}
+				go s.handleQUIC(qconn)
+			}
+		}()
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)

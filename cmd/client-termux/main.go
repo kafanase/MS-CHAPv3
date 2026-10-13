@@ -42,7 +42,7 @@ func main() {
 	}
 	log.Printf("SOCKS5 on %s -> %s (tls=%v)", cfg.Listen, cfg.Server, cfg.TLS.Enabled)
 
-	go localproxy.Serve(ln, cl.Dial)
+	go localproxy.ServeWithUDP(ln, cl.Dial, cl.DialUDP)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig

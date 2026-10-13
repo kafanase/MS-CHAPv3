@@ -54,6 +54,12 @@ var (
 	ErrAuth        = errors.New("wire: authentication failed")
 )
 
+// Коды команд запроса.
+const (
+	CmdConnect byte = 1
+	CmdUDP     byte = 3
+)
+
 // Коды статуса ответа сервера на запрос соединения.
 const (
 	StatusOK          byte = 0
@@ -185,8 +191,8 @@ func bindingFor(tlsBinding, cpub, spub []byte) []byte {
 
 // ---------- запрос на соединение ----------
 
-func WriteRequest(w io.Writer, host string, port uint16) error {
-	b := []byte{1, 0}
+func WriteRequestCmd(w io.Writer, cmd byte, host string, port uint16) error {
+	b := []byte{cmd, 0}
 	if ip := net.ParseIP(host); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
 			b[1] = 1
@@ -208,15 +214,19 @@ func WriteRequest(w io.Writer, host string, port uint16) error {
 	return err
 }
 
-func ReadRequest(r io.Reader) (string, uint16, error) {
+func WriteRequest(w io.Writer, host string, port uint16) error {
+	return WriteRequestCmd(w, CmdConnect, host, port)
+}
+
+func ReadRequestCmd(r io.Reader) (cmd byte, host string, port uint16, err error) {
 	var h [2]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
-		return "", 0, err
+		return 0, "", 0, err
 	}
-	if h[0] != 1 {
-		return "", 0, ErrMalformed
+	cmd = h[0]
+	if cmd != CmdConnect && cmd != CmdUDP {
+		return 0, "", 0, ErrMalformed
 	}
-	var host string
 	switch h[1] {
 	case 1, 4:
 		n := 4
@@ -225,30 +235,98 @@ func ReadRequest(r io.Reader) (string, uint16, error) {
 		}
 		ip := make([]byte, n)
 		if _, err := io.ReadFull(r, ip); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		host = net.IP(ip).String()
 	case 3:
 		var l [1]byte
 		if _, err := io.ReadFull(r, l[:]); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		if l[0] == 0 {
-			return "", 0, ErrMalformed
+			return 0, "", 0, ErrMalformed
 		}
 		d := make([]byte, l[0])
 		if _, err := io.ReadFull(r, d); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		host = string(d)
 	default:
-		return "", 0, ErrMalformed
+		return 0, "", 0, ErrMalformed
 	}
 	var p [2]byte
 	if _, err := io.ReadFull(r, p[:]); err != nil {
-		return "", 0, err
+		return 0, "", 0, err
 	}
-	return host, binary.BigEndian.Uint16(p[:]), nil
+	return cmd, host, binary.BigEndian.Uint16(p[:]), nil
+}
+
+func ReadRequest(r io.Reader) (string, uint16, error) {
+	_, host, port, err := ReadRequestCmd(r)
+	return host, port, err
+}
+
+// EncodeUDPDatagram кодирует хост, порт и данные пакета в компактный бинарный кадр:
+// [ATYP 1b][ADDR][PORT 2b][PAYLOAD...]
+func EncodeUDPDatagram(host string, port uint16, payload []byte) ([]byte, error) {
+	var b []byte
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			b = append(b, 1)
+			b = append(b, v4...)
+		} else {
+			b = append(b, 4)
+			b = append(b, ip.To16()...)
+		}
+	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return nil, ErrMalformed
+		}
+		b = append(b, 3, byte(len(host)))
+		b = append(b, host...)
+	}
+	b = append(b, byte(port>>8), byte(port))
+	b = append(b, payload...)
+	return b, nil
+}
+
+// DecodeUDPDatagram декодирует бинарный кадр пакета в (host, port, payload).
+func DecodeUDPDatagram(data []byte) (host string, port uint16, payload []byte, err error) {
+	if len(data) < 4 {
+		return "", 0, nil, ErrMalformed
+	}
+	atyp := data[0]
+	idx := 1
+	switch atyp {
+	case 1: // IPv4
+		if len(data) < 1+4+2 {
+			return "", 0, nil, ErrMalformed
+		}
+		host = net.IP(data[1:5]).String()
+		idx = 5
+	case 4: // IPv6
+		if len(data) < 1+16+2 {
+			return "", 0, nil, ErrMalformed
+		}
+		host = net.IP(data[1:17]).String()
+		idx = 17
+	case 3: // Domain
+		if len(data) < 2 {
+			return "", 0, nil, ErrMalformed
+		}
+		l := int(data[1])
+		if l == 0 || len(data) < 2+l+2 {
+			return "", 0, nil, ErrMalformed
+		}
+		host = string(data[2 : 2+l])
+		idx = 2 + l
+	default:
+		return "", 0, nil, ErrMalformed
+	}
+	port = binary.BigEndian.Uint16(data[idx : idx+2])
+	idx += 2
+	payload = data[idx:]
+	return host, port, payload, nil
 }
 
 // ---------- AEAD-слой (режим без TLS) ----------
@@ -438,6 +516,11 @@ type ClientParams struct {
 // ClientConnect выполняет handshake и запрос соединения с host:port.
 // conn — уже установленное соединение (TCP или TLS).
 func ClientConnect(conn net.Conn, p ClientParams, host string, port uint16) (Stream, error) {
+	return ClientConnectCmd(conn, p, CmdConnect, host, port)
+}
+
+// ClientConnectCmd выполняет handshake и запрос с указанной командой (CmdConnect или CmdUDP).
+func ClientConnectCmd(conn net.Conn, p ClientParams, cmd byte, host string, port uint16) (Stream, error) {
 	br := bufio.NewReader(conn)
 	cl := mschapv3.NewClient(p.Username, p.Password, nil)
 	cl.Cache = p.Cache
@@ -501,7 +584,7 @@ func ClientConnect(conn net.Conn, p ClientParams, host string, port uint16) (Str
 		}
 	}
 	// Запрос уходит сразу, не дожидаясь ответа сервера (экономия RTT).
-	if err := WriteRequest(st, host, port); err != nil {
+	if err := WriteRequestCmd(st, cmd, host, port); err != nil {
 		return nil, err
 	}
 
@@ -536,6 +619,7 @@ type ServerParams struct {
 
 type Session struct {
 	Stream Stream
+	Cmd    byte
 	User   string
 	Host   string
 	Port   uint16
@@ -613,9 +697,9 @@ func ServerAccept(conn net.Conn, br *bufio.Reader, p ServerParams) (sess *Sessio
 			return nil, user, err
 		}
 	}
-	host, port, err := ReadRequest(st)
+	cmd, host, port, err := ReadRequestCmd(st)
 	if err != nil {
 		return nil, user, err
 	}
-	return &Session{Stream: st, User: user, Host: host, Port: port}, user, nil
+	return &Session{Stream: st, Cmd: cmd, User: user, Host: host, Port: port}, user, nil
 }
