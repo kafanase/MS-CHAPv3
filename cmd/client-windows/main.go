@@ -59,7 +59,7 @@ func main() {
 		log.Println("Windows system proxy enabled; it will be restored on exit (Ctrl+C)")
 	}
 
-	go localproxy.Serve(ln, cl.Dial)
+	go localproxy.ServeWithUDP(ln, cl.Dial, cl.DialUDP)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig

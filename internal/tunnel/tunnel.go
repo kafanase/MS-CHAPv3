@@ -16,6 +16,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
+	"mschapv3proxy/internal/localproxy"
 	"mschapv3proxy/internal/wire"
 	"mschapv3proxy/mschapv3"
 )
@@ -147,4 +150,101 @@ func (c *Client) Dial(host string, port uint16) (wire.Stream, error) {
 	}
 	raw.SetDeadline(time.Time{})
 	return st, nil
+}
+
+type quicStreamConn struct {
+	quic.Stream
+	laddr net.Addr
+	raddr net.Addr
+}
+
+func (s *quicStreamConn) LocalAddr() net.Addr  { return s.laddr }
+func (s *quicStreamConn) RemoteAddr() net.Addr { return s.raddr }
+func (s *quicStreamConn) CloseWrite() error    { return s.Stream.Close() }
+
+type quicUDPSession struct {
+	qconn      quic.Connection
+	ctrlStream wire.Stream
+}
+
+func (s *quicUDPSession) SendUDP(host string, port uint16, payload []byte) error {
+	b, err := wire.EncodeUDPDatagram(host, port, payload)
+	if err != nil {
+		return err
+	}
+	return s.qconn.SendDatagram(b)
+}
+
+func (s *quicUDPSession) ReceiveUDP(ctx context.Context) (string, uint16, []byte, error) {
+	b, err := s.qconn.ReceiveDatagram(ctx)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return wire.DecodeUDPDatagram(b)
+}
+
+func (s *quicUDPSession) Close() error {
+	if s.ctrlStream != nil {
+		s.ctrlStream.Close()
+	}
+	return s.qconn.CloseWithError(0, "")
+}
+
+func (c *Client) DialUDP(ctx context.Context) (localproxy.UDPSession, error) {
+	tc := c.tlsCfg
+	if tc == nil {
+		host, _, _ := net.SplitHostPort(c.cfg.Server)
+		tc = &tls.Config{
+			MinVersion:         tls.VersionTLS13,
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"mschapv3-quic"},
+			ServerName:         host,
+		}
+	} else {
+		tc = tc.Clone()
+		tc.NextProtos = append([]string{"mschapv3-quic"}, tc.NextProtos...)
+	}
+
+	qconf := &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: 15 * time.Second,
+	}
+
+	qconn, err := quic.DialAddr(ctx, c.cfg.Server, tc, qconf)
+	if err != nil {
+		return nil, fmt.Errorf("quic dial: %w", err)
+	}
+
+	st, err := qconn.OpenStreamSync(ctx)
+	if err != nil {
+		qconn.CloseWithError(0, "")
+		return nil, fmt.Errorf("quic open stream: %w", err)
+	}
+
+	cs := qconn.ConnectionState().TLS
+	binding, err := cs.ExportKeyingMaterial("EXPORTER-MSCHAPV3", nil, 32)
+	if err != nil {
+		qconn.CloseWithError(0, "")
+		return nil, fmt.Errorf("quic tls exporter: %w", err)
+	}
+
+	streamConn := &quicStreamConn{
+		Stream: st,
+		laddr:  qconn.LocalAddr(),
+		raddr:  qconn.RemoteAddr(),
+	}
+
+	wireStream, err := wire.ClientConnectCmd(streamConn, wire.ClientParams{
+		Username: c.cfg.Username, Password: c.cfg.Password, Cache: c.cache,
+		TLSBinding: binding, Encrypt: false, MinIterations: c.cfg.MinKDFIterations,
+	}, wire.CmdUDP, "udp", 0)
+	if err != nil {
+		qconn.CloseWithError(0, "")
+		return nil, err
+	}
+
+	return &quicUDPSession{
+		qconn:      qconn,
+		ctrlStream: wireStream,
+	}, nil
 }

@@ -152,13 +152,34 @@ func TestTruncationDetected(t *testing.T) {
 
 func TestRequestCodec(t *testing.T) {
 	for _, h := range []string{"example.org", "1.2.3.4", "2001:db8::1"} {
-		var b bytes.Buffer
-		if err := WriteRequest(&b, h, 8080); err != nil {
-			t.Fatal(err)
+		for _, cmd := range []byte{CmdConnect, CmdUDP} {
+			var b bytes.Buffer
+			if err := WriteRequestCmd(&b, cmd, h, 8080); err != nil {
+				t.Fatal(err)
+			}
+			gotCmd, host, port, err := ReadRequestCmd(&b)
+			if err != nil || gotCmd != cmd || host != h || port != 8080 {
+				t.Fatalf("cmd=%d %s -> cmd=%d %s %d %v", cmd, h, gotCmd, host, port, err)
+			}
 		}
-		host, port, err := ReadRequest(&b)
-		if err != nil || host != h || port != 8080 {
-			t.Fatalf("%s -> %s %d %v", h, host, port, err)
+	}
+}
+
+func TestUDPDatagramCodec(t *testing.T) {
+	hosts := []string{"1.2.3.4", "2001:db8::1", "dns.google"}
+	payload := []byte("hello udp world")
+
+	for _, h := range hosts {
+		enc, err := EncodeUDPDatagram(h, 5353, payload)
+		if err != nil {
+			t.Fatalf("Encode error for %s: %v", h, err)
+		}
+		host, port, gotPayload, err := DecodeUDPDatagram(enc)
+		if err != nil {
+			t.Fatalf("Decode error for %s: %v", h, err)
+		}
+		if host != h || port != 5353 || !bytes.Equal(gotPayload, payload) {
+			t.Fatalf("Mismatch for %s: got %s:%d %q", h, host, port, string(gotPayload))
 		}
 	}
 }
